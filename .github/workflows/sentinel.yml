@@ -1,0 +1,100 @@
+name: Sentinel Policy
+
+permissions:
+  contents: read
+  statuses: write
+  pull-requests: write
+  issues: write
+
+# Same trigger as ci.yml — fires alongside the main CI pipeline
+on:
+  issue_comment:
+    types:
+      - created
+
+env:
+  SENTINEL_VERSION: "0.26.2"
+
+jobs:
+  sentinel-policy-check:
+    name: Sentinel Policy Check
+    runs-on: ubuntu-latest
+    # Only run when the comment is on a pull request
+    if: github.event.issue.pull_request != null
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+
+      # ── Step 1: Generate real plan JSON from examples/basic ─────────────────
+      # examples/basic does NOT set disable_public_service_endpoint, so the plan
+      # will have it as false — this is the non-compliant state the policy catches.
+      - name: Terraform Init
+        working-directory: examples/basic
+        env:
+          TF_VAR_ibmcloud_api_key: ${{ secrets.TF_VAR_IBMCLOUD_API_KEY }}
+          TF_VAR_prefix: "sentinel-ci"
+          TF_VAR_region: "us-south"
+        run: terraform init -input=false
+
+      - name: Generate real Terraform plan JSON
+        working-directory: examples/basic
+        env:
+          TF_VAR_ibmcloud_api_key: ${{ secrets.TF_VAR_IBMCLOUD_API_KEY }}
+          TF_VAR_prefix: "sentinel-ci"
+          TF_VAR_region: "us-south"
+        run: |
+          terraform plan -input=false -out=tfplan.binary
+          terraform show -json tfplan.binary > ../../sentinel/mocks/plan.json
+          rm -f tfplan.binary
+
+      # ── Step 2: Install Sentinel CLI ─────────────────────────────────────────
+      - name: Install Sentinel CLI
+        run: |
+          wget -q \
+            "https://releases.hashicorp.com/sentinel/${SENTINEL_VERSION}/sentinel_${SENTINEL_VERSION}_linux_amd64.zip"
+          unzip -q "sentinel_${SENTINEL_VERSION}_linux_amd64.zip" -d "$HOME/bin"
+          chmod +x "$HOME/bin/sentinel"
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+
+      - name: Sentinel version
+        run: sentinel version
+
+      # ── Step 3: Enforce policy against the real plan ─────────────────────────
+      # The real plan from examples/basic has disable_public_service_endpoint=false
+      # so the policy will FAIL — this is the expected finding for the module.
+      - name: Enforce Sentinel policy (hard-mandatory)
+        working-directory: sentinel
+        run: sentinel apply -config=sentinel.hcl -trace
+
+      - name: Post PR comment on policy violation
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: [
+                '❌ **Sentinel policy failed** — `check-ocp-private-endpoint`',
+                '',
+                '`ibm_container_vpc_cluster` has `disable_public_service_endpoint = false`.',
+                'The cluster API server is reachable over the public internet.',
+                '',
+                '**Fix:** set `disable_public_endpoint = true` in your cluster configuration.',
+              ].join('\n')
+            })
+
+      - name: Upload plan and Sentinel results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sentinel-results
+          path: sentinel/mocks/plan.json
+          retention-days: 7
